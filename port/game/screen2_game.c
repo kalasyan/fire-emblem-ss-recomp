@@ -443,6 +443,13 @@ const struct PortS2State *Port_S2Snapshot(void)
     return s;
 }
 
+int Port_S2TerrainAt(int x, int y)
+{
+    if (!gBmMapTerrain || x < 0 || y < 0 || x >= gBmMapSize.x || y >= gBmMapSize.y)
+        return -1;
+    return gBmMapTerrain[y][x];
+}
+
 // ---- requests ---------------------------------------------------------------
 
 static int sMoveX = -1, sMoveY = -1;

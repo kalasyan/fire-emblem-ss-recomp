@@ -6,6 +6,7 @@
 //                [--press FRAME:KEYS:LEN ...] [--wav FILE]
 //                [--state-save FRAME:FILE] [--state-load FRAME:FILE] [--dump-mem FRAME:FILE]
 //                [--screen2 MODE] [--touch2 FRAME:X:Y[:LEN] ...] [--width W]
+//                [--dump-3d FRAME]
 //
 // Frames are written as PPM images (no dependencies). KEYS is a combination
 // of the letters A B s(elect) S(tart) R(ight) L(eft) U(p) D(own) r l.
@@ -16,6 +17,8 @@
 // --screen2 also dumps the second screen (1 map, 2 unit, 3 army) next to each
 // frame, 256x224; --touch2 touches it at X,Y for LEN frames (default 2).
 // --width renders a wider picture (widescreen option, e.g. 284 = 16:9).
+// --dump-3d FRAME writes the whole battle map, its terrain and the units with
+// their standing sprites at FRAME (map3d_* in the output folder), for 3D view tests.
 #include "port.h"
 #include "port_screen2.h"
 #include "../../include/port/screen2.h"
@@ -36,6 +39,7 @@ static uint64_t sDumpEvery = 60;
 static struct { uint64_t frame; const char* path; } sMemDumps[8];
 static int sMemDumpCount;
 static const char* sOutDir = "frames";
+static uint64_t sDump3dFrame = UINT64_MAX;
 static const char* sSavePath = "fe8_headless.sav";
 static const char* sRomPath = "fe8_us.gba";
 static const char* sWavPath;
@@ -126,6 +130,9 @@ bool Port_HostInit(const PortHostConfig* cfg)
             op->path = (*end == ':') ? end + 1 : "";
             op->load = strcmp(a, "--state-load") == 0;
             i++;
+        } else if (strcmp(a, "--dump-3d") == 0 && v) {
+            sDump3dFrame = strtoull(v, NULL, 10);
+            i++;
         } else if (strcmp(a, "--width") == 0 && v) {
             Port_WideSetWidth(atoi(v));
             i++;
@@ -202,6 +209,60 @@ void Port_HostShutdown(void)
     Port_Log("headless: stopped after %llu frames", (unsigned long long)Port_FrameCount());
 }
 
+// Writes what a 3D view of the battle map needs: the whole map picture, the
+// terrain of each tile and the units with their standing sprites (RGBA).
+static void Dump3d(void)
+{
+    const struct PortS2State* s = Port_S2Snapshot();
+    char path[512];
+    FILE* f;
+
+    if (!s->onMap || !s->mapPx) {
+        Port_Log("dump-3d: not on the battle map");
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/map3d_map.pam", sOutDir);
+    if ((f = fopen(path, "wb"))) {
+        fprintf(f, "P7\nWIDTH %d\nHEIGHT %d\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", s->mapW * 16, s->mapH * 16);
+        fwrite(s->mapPx, 4, (size_t)s->mapW * 16 * s->mapH * 16, f);
+        fclose(f);
+    }
+    snprintf(path, sizeof(path), "%s/map3d.txt", sOutDir);
+    if (!(f = fopen(path, "w")))
+        return;
+    fprintf(f, "map %d %d\ncamera %d %d %d\ncursor %d %d\n", s->mapW, s->mapH, s->cameraX, s->cameraY, s->cameraW,
+            s->cursorX, s->cursorY);
+    for (int y = 0; y < s->mapH; y++) {
+        fprintf(f, "terrain");
+        for (int x = 0; x < s->mapW; x++)
+            fprintf(f, " %d", Port_S2TerrainAt(x, y));
+        fprintf(f, "\n");
+    }
+    for (int i = 0; i < s->unitCount; i++) {
+        const struct PortS2Unit* u = &s->units[i];
+        const int pal = u->acted ? 4 : u->faction;
+        int w, h;
+        const unsigned int* px = Port_S2Sprite(u->sms, pal, 0, &w, &h);
+        if (!px)
+            continue;
+        char name[64];
+        snprintf(name, sizeof(name), "map3d_sms%d_%d.pam", u->sms, pal);
+        fprintf(f, "unit %d %d %d %s %s\n", u->x, u->y, u->faction, name, u->name);
+        snprintf(path, sizeof(path), "%s/%s", sOutDir, name);
+        FILE* g = fopen(path, "wb");
+        if (g) {
+            fprintf(g, "P7\nWIDTH %d\nHEIGHT %d\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", w, h * 3);
+            for (int k = 0; k < w * h * 3; k++) {
+                const unsigned int p = px[k] ? (px[k] | 0xFF000000u) : 0;
+                fwrite(&p, 4, 1, g);
+            }
+            fclose(g);
+        }
+    }
+    fclose(f);
+    Port_Log("dump-3d: %dx%d map, %d units", s->mapW, s->mapH, s->unitCount);
+}
+
 static void WritePpm(const uint32_t* abgr, int width, int height, uint64_t frame, const char* name)
 {
     char path[512];
@@ -236,6 +297,11 @@ bool Port_HostPresent(const uint32_t* abgr, int width, int height)
                 fclose(f);
             }
         }
+    }
+
+    if (frame == sDump3dFrame) {
+        WritePpm(abgr, width, height, frame, "map3d_frame");
+        Dump3d();
     }
 
     if (sScreen2Mode) {

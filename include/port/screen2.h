@@ -103,6 +103,9 @@ const struct PortS2State* Port_S2Snapshot(void);
  * (or 4 = grey). NULL if it can't be drawn. Game thread only. */
 const unsigned int* Port_S2Sprite(int sms, int palette, int frame, int* w, int* h);
 
+/* The terrain id (TERRAIN_*) of a map tile, -1 outside the map. */
+int Port_S2TerrainAt(int x, int y);
+
 /* Asks the game to put the map cursor on a tile (and the camera on it).
  * Applied at the next frame boundary, when the player can move the cursor. */
 void Port_S2MoveCursor(int x, int y);
