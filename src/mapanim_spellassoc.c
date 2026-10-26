@@ -255,6 +255,11 @@ void MapAnim_BeginRoundSpecificAnims(ProcPtr proc)
         return;
     }
 
+#ifdef PLATFORM_PC
+    Port_RumbleHit(gManimSt.hitDamage, !!(gManimSt.hitAttributes & BATTLE_HIT_ATTR_CRIT),
+                   gManimSt.actor[map_target].hp_cur == 0); // already lowered above
+#endif
+
     vall_broken = false;
     if (gManimSt.actor[map_target].bu->terrainId == TERRAIN_WALL_DAMAGED || gManimSt.actor[map_target].bu->terrainId == TERRAIN_SNAG)
         vall_broken = true;

@@ -55,6 +55,10 @@ extern void *gPortIntrVector;
 
 void Port_Log(const char *fmt, ...);
 
+/* Rumble (port/src/rumble.c): a hit's damage shows up now, in a battle scene
+ * or on the map. */
+void Port_RumbleHit(int damage, int critical, int lethal);
+
 /* The message to read for a message index: in the European version the
  * message table holds every language in turn (port/game/eu_language.c). */
 int Port_LocalizeMsg(int index);

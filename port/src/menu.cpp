@@ -17,9 +17,9 @@ enum Page {
     PAGE_STATES,
     PAGE_CONTROLS,
     PAGE_VIDEO,
-    PAGE_SCREEN2,
     PAGE_SOUND_SPEED,
     PAGE_TOUCH,
+    PAGE_EXTRAS,
     PAGE_COUNT
 };
 
@@ -27,9 +27,9 @@ const char* const kPageNames[PAGE_COUNT] = {
     "Quick saves",
     "Controls",
     "Video",
-    "Second screen",
     "Sound and speed",
     "Touch controls",
+    "Second screen and rumble",
 };
 
 const char* const kInputLabels[PORT_INPUT_COUNT] = {
@@ -328,11 +328,26 @@ void PageVideo()
          "stay 3:2 in the middle, and maps narrower than the screen keep black bars.");
     changed |= ImGui::Checkbox("Vertical sync (VSync)", &cfg.vsync);
     Hint("VSync stops tearing, but can add a little latency.");
+
+    ImGui::Spacing();
+    ImGui::SeparatorText("Smoothness");
+    changed |= ImGui::Checkbox("Match the game speed to the display", &cfg.syncToDisplay);
+    Hint("On 60, 120 or 240 Hz displays the game runs 0.46% faster to match the display: no stutter. "
+         "The sound adjusts itself. Turns VSync on.");
+    changed |= ImGui::Checkbox("Blend frames (90, 144 Hz...)", &cfg.frameBlend);
+    Hint("If the display isn't 60 Hz or a multiple of it, every refresh blends the last two frames "
+         "to smooth out motion (leaves a slight trail). Turns VSync on.");
+    if (sHost.syncStatus) {
+        char status[160];
+        sHost.syncStatus(status, sizeof(status));
+        Hint(status);
+    }
     if (changed)
         sHost.applyConfig();
 }
 
-void PageSecondScreen()
+// Rumble and the second screen (AYN Thor's lower display, a window on PC).
+void PageExtras()
 {
     PortConfig& cfg = Config();
     static const struct {
@@ -346,6 +361,21 @@ void PageSecondScreen()
         { "Army list", "Your units, the enemies and the other armies with their HP. Tap one to put the cursor on it." },
     };
 
+    bool changed = false;
+
+    ImGui::SeparatorText("Rumble");
+    changed |= ImGui::Checkbox("Gamepad rumble", &cfg.rumbleGamepad);
+#ifdef __ANDROID__
+    changed |= ImGui::Checkbox("Device vibration", &cfg.rumbleDevice);
+#endif
+    changed |= ImGui::SliderInt("Strength", &cfg.rumbleStrength, 0, 100, "%d %%");
+    Hint("On every hit in battle, stronger for big hits and critical hits, and strongest for the blow "
+         "that defeats a unit.");
+    if (changed)
+        sHost.applyConfig();
+
+    ImGui::Spacing();
+    ImGui::SeparatorText("Second screen");
 #ifdef __ANDROID__
     Hint("On devices with two screens, like the AYN Thor, this shows on the lower one.");
 #else
@@ -549,7 +579,14 @@ void MainWindow()
                      ImGuiWindowFlags_NoSavedSettings);
 
     // Left: sections. Right: the selected page.
-    ImGui::BeginChild("nav", ImVec2(170.0f * sScale, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened);
+    // Wide enough for the longest page name.
+    float navWidth = 170.0f * sScale;
+    for (int i = 0; i < PAGE_COUNT; i++) {
+        const float w = ImGui::CalcTextSize(kPageNames[i]).x + 4.0f * ImGui::GetStyle().WindowPadding.x;
+        if (w > navWidth)
+            navWidth = w;
+    }
+    ImGui::BeginChild("nav", ImVec2(navWidth, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened);
     if (ImGui::Selectable("Resume", false))
         Close();
     ImGui::Separator();
@@ -574,9 +611,9 @@ void MainWindow()
     case PAGE_STATES: PageStates(); break;
     case PAGE_CONTROLS: PageControls(); break;
     case PAGE_VIDEO: PageVideo(); break;
-    case PAGE_SCREEN2: PageSecondScreen(); break;
     case PAGE_SOUND_SPEED: PageSoundSpeed(); break;
     case PAGE_TOUCH: PageTouch(); break;
+    case PAGE_EXTRAS: PageExtras(); break;
     default: break;
     }
     if (sStatus[0]) {

@@ -68,6 +68,15 @@ void NewEfxHpBar(struct Anim * anim)
     proc->timer2 = 0;
     proc->finished = false;
     gEkrHitNow[GetAnimPosition(proc->anim_main_this)] = 1;
+
+#ifdef PLATFORM_PC
+    {
+        s16 round = GetAnimRoundTypeAnotherSide(proc->anim_main_this);
+
+        Port_RumbleHit(proc->this - proc->next, round == ANIM_ROUND_CRIT_CLOSE || round == ANIM_ROUND_CRIT_FAR,
+                       proc->next == 0);
+    }
+#endif
 }
 
 void EfxHpBar_DeclineToDeath(struct ProcEfxHpBar * proc)

@@ -96,6 +96,8 @@ typedef struct PortConfig {
     bool integerScaling;
     bool smoothScaling;
     int filter; // PORT_FILTER_*
+    bool syncToDisplay; // game speed locked to the refresh rate (port_pacing.h)
+    bool frameBlend;    // mix the last two frames on 90/144 Hz... screens
     int widescreen; // PORT_WIDE_*
     int secondScreen; // PORT_SCREEN2_* (port_screen2.h): AYN Thor's lower screen, a window on PC
     // [audio]
@@ -109,6 +111,10 @@ typedef struct PortConfig {
     PortBinding bindings[PORT_INPUT_COUNT];
     // [touch]
     PortTouchButton touch[PORT_TOUCH_BUTTON_COUNT];
+    // [rumble]
+    bool rumbleGamepad; // the gamepad's motors
+    bool rumbleDevice;  // the phone's / handheld's own vibrator (Android)
+    int rumbleStrength; // percent
 } PortConfig;
 
 void PortConfig_Defaults(PortConfig* cfg);

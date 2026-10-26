@@ -300,6 +300,15 @@ void Port_HostWaitFrame(void)
 {
 }
 
+void Port_HostRumble(float low, float high, float pulse, int pulseMs)
+{
+    // Nothing to shake; FE8_RUMBLE_LOG=1 shows the hits.
+    (void)low;
+    (void)high;
+    (void)pulse;
+    (void)pulseMs;
+}
+
 void Port_HostFrameBoundary(void)
 {
     for (int i = 0; i < sStateOpCount; i++) {

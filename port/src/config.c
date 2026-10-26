@@ -6,6 +6,8 @@
 //   [video]
 //   window_scale = 4
 //   integer_scaling = true
+//   sync_to_display = false      ; lock the game to 60/120 Hz screens
+//   frame_blend = false          ; mix frames on 90/144 Hz screens
 //   widescreen = auto            ; off | auto | 16:10 | 16:9 | 2:1
 //   [audio]
 //   volume = 100                 ; percent, 0 = muted
@@ -131,6 +133,11 @@ void PortConfig_Defaults(PortConfig* cfg)
     cfg->fastForwardToggle = false;
     cfg->filter = PORT_FILTER_NONE;
     cfg->widescreen = PORT_WIDE_AUTO;
+    cfg->syncToDisplay = false;
+    cfg->frameBlend = false;
+    cfg->rumbleGamepad = false;
+    cfg->rumbleDevice = false;
+    cfg->rumbleStrength = 100;
     cfg->secondScreen = PORT_SCREEN2_OFF;
     PortConfig_DefaultBindings(cfg);
     PortConfig_DefaultTouchLayout(cfg);
@@ -285,6 +292,10 @@ bool PortConfig_Load(PortConfig* cfg, const char* path)
                 const int f = FindName(sFilterNames, PORT_FILTER_COUNT, value);
                 if (f >= 0)
                     cfg->filter = f;
+            } else if (strcmp(key, "sync_to_display") == 0) {
+                cfg->syncToDisplay = ParseBool(value);
+            } else if (strcmp(key, "frame_blend") == 0) {
+                cfg->frameBlend = ParseBool(value);
             } else if (strcmp(key, "widescreen") == 0) {
                 const int w = FindName(sWideNames, PORT_WIDE_COUNT, value);
                 if (w >= 0)
@@ -296,6 +307,13 @@ bool PortConfig_Load(PortConfig* cfg, const char* path)
                 if (m >= 0)
                     cfg->secondScreen = m;
             }
+        } else if (strcmp(section, "rumble") == 0) {
+            if (strcmp(key, "gamepad") == 0)
+                cfg->rumbleGamepad = ParseBool(value);
+            else if (strcmp(key, "device") == 0)
+                cfg->rumbleDevice = ParseBool(value);
+            else if (strcmp(key, "strength") == 0)
+                cfg->rumbleStrength = ParseInt(value, 0, 100, cfg->rumbleStrength);
         } else if (strcmp(section, "audio") == 0) {
             if (strcmp(key, "volume") == 0)
                 cfg->volume = ParseInt(value, 0, 100, cfg->volume);
@@ -352,8 +370,16 @@ bool PortConfig_Save(const PortConfig* cfg, const char* path)
     fprintf(f, "integer_scaling = %s\n", cfg->integerScaling ? "true" : "false");
     fprintf(f, "smooth_scaling = %s\n", cfg->smoothScaling ? "true" : "false");
     fprintf(f, "filter = %s ; none | lcd | crt\n", sFilterNames[cfg->filter]);
+    fprintf(f, "sync_to_display = %s ; game speed locked to 60/120 Hz screens (+0.46 %%)\n",
+            cfg->syncToDisplay ? "true" : "false");
+    fprintf(f, "frame_blend = %s ; mix frames on 90/144 Hz screens\n", cfg->frameBlend ? "true" : "false");
     fprintf(f, "widescreen = %s ; off | auto | 16:10 | 16:9 | 2:1\n", sWideNames[cfg->widescreen]);
     fprintf(f, "second_screen = %s ; off | map | unit | army\n\n", sScreen2Names[cfg->secondScreen]);
+
+    fprintf(f, "[rumble]\n");
+    fprintf(f, "gamepad = %s\n", cfg->rumbleGamepad ? "true" : "false");
+    fprintf(f, "device = %s ; the phone's own vibrator (Android)\n", cfg->rumbleDevice ? "true" : "false");
+    fprintf(f, "strength = %d ; percent\n\n", cfg->rumbleStrength);
 
     fprintf(f, "[audio]\n");
     fprintf(f, "volume = %d ; percent, 0 = muted\n\n", cfg->volume);

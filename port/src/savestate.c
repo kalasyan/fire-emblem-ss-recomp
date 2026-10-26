@@ -131,6 +131,7 @@ PortStateResult Port_StateLoad(const uint8_t* buf, size_t size)
         Port_RawCopy(r[i].data, buf, r[i].size);
         buf += r[i].size;
     }
+    Port_RumbleReset();
     return PORT_STATE_OK;
 }
 

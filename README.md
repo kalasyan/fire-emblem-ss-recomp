@@ -57,6 +57,8 @@ so the repository and the APKs contain no game data.
   battle scenes and cutscenes stay 3:2 in the middle.
 - 💾 **Quick saves:** 4 slots with thumbnail (`F5` / `F8`), on top of the normal in-game save.
 - 🎨 **Video options:** LCD grid or CRT scanlines filter, smooth or integer scaling, VSync.
+- 🌊 **Smoothness options:** match the game speed to 60/120 Hz displays, or frame blending for 90/144 Hz.
+- 📳 **Rumble** on every hit in battle, on gamepads and on the device itself.
 - ⏩ **Fast-forward** (x2 to x10, hold or toggle).
 - 🎮 **Keyboard and gamepad** with remappable buttons.
 - 🌍 **Europe and USA** builds. The European version keeps its five languages.

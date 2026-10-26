@@ -11,11 +11,16 @@
 // button open the options menu (port/src/menu.cpp) with save states.
 // Second screen: the battle map, unit info or army list (port/src/second_screen.c)
 // on a second display (AYN Thor) or in a second window.
+// Pacing: by default one game frame every 1/59.73 s by the clock. Optionally
+// the game is locked to the display's refresh rate (60/120 Hz...) with the
+// sound resampled to match, or frames are blended on 90/144 Hz screens
+// (port_pacing.h). Neither changes the game's logic.
 // Everything configurable lives in settings.ini in the app's pref folder.
 #include "port.h"
 #include "port_config.h"
 #include "port_assets.h"
 #include "port_menu.h"
+#include "port_pacing.h"
 #include "port_screen2.h"
 
 #include <SDL3/SDL.h>
@@ -23,7 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define GBA_FRAME_NS 16742706ull // 280896 cycles / 16.777216 MHz
+#define GBA_FRAME_NS PORT_GBA_FRAME_NS // 280896 cycles / 16.777216 MHz
 #define THUMB_BYTES (GBA_SCREEN_WIDTH * GBA_SCREEN_HEIGHT * 4)
 
 static SDL_Window* sWindow;
@@ -57,6 +62,28 @@ static uint64_t sToastUntilNs;
 static SDL_Texture* sMask;         // LCD/CRT pattern, multiplied over the game
 static SDL_Texture* sEffectTarget; // the game, scaled up for the pattern
 static int sMaskW, sMaskH, sMaskFilter;
+
+// Display pacing (port_pacing.h).
+static double sRefreshHz;         // current display, 0 if unknown
+static uint64_t sRefreshNs;       // one refresh, 0 if unknown
+static int sSyncDivisor;          // > 0: locked, one game frame every N refreshes
+static double sSyncSpeed = 1.0;   // game speed while locked (1.0046 at 60 Hz)
+static uint64_t sSyncFrameNs;     // game frame while locked
+static int sAudioChunk;           // sound device buffer, in 48 kHz sample frames
+static double sAudioQueued;       // smoothed queue level, in sample frames
+static double sAudioRatio = 1.0;  // playback speed given to the stream
+static SDL_Texture* sPrevTexture; // previous game frame, for frame blending
+static bool sPrevValid;
+static bool sBlendActive;         // frames are being blended right now
+static uint64_t sFrameShownNs;    // when the newest game frame was first presented
+static float sVsyncScore = 1.0f;  // ~fraction of recent presents that waited for VSync
+static double sMeasuredHz;        // refresh rate seen while locked, if not the reported one
+static uint64_t sLastPresentNs;
+static uint32_t sIntervals[64];   // recent present-to-present times while locked
+static int sIntervalCount;
+static bool sSyncLog;             // FE8_SYNC_LOG: print pacing stats
+static uint64_t sSyncLogNs, sSyncLogFrames;
+static int sAudioDry, sAudioDropped; // for FE8_SYNC_LOG
 
 static SDL_Texture* sThumbs[PORT_STATE_SLOTS + 1];
 static bool sThumbsValid[PORT_STATE_SLOTS + 1];
@@ -245,10 +272,105 @@ static void OpenAudio(void)
 {
     const SDL_AudioSpec spec = { SDL_AUDIO_S16, 2, PORT_AUDIO_RATE };
     sAudio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
-    if (sAudio)
+    if (sAudio) {
+        SDL_AudioSpec deviceSpec;
+        int frames = 0;
+        if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(sAudio), &deviceSpec, &frames) && frames > 0)
+            sAudioChunk = (int)((double)frames * PORT_AUDIO_RATE / SDL_max(deviceSpec.freq, 1));
+        SDL_SetAudioStreamFrequencyRatio(sAudio, (float)sAudioRatio);
         SDL_ResumeAudioStreamDevice(sAudio);
-    else
+    } else {
         Port_Log("no sound: %s", SDL_GetError()); // the game still runs
+    }
+}
+
+// ---- pacing -------------------------------------------------------------------
+
+// Locking to the display and blending only make sense if presenting waits
+// for the refresh, so both turn VSync on.
+static bool VsyncWanted(void)
+{
+    return sConfig.vsync || sConfig.syncToDisplay || sConfig.frameBlend;
+}
+
+static bool FastForwarding(void)
+{
+    return sConfig.fastForwardToggle ? sFastForwardOn : sFastForwardHeld;
+}
+
+static void SetAudioRatio(double ratio)
+{
+    if (ratio == sAudioRatio)
+        return;
+    sAudioRatio = ratio;
+    if (sAudio)
+        SDL_SetAudioStreamFrequencyRatio(sAudio, (float)ratio);
+}
+
+// Reads the display's refresh rate and decides how to pace the game.
+static void UpdateDisplaySync(void)
+{
+    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(sWindow));
+    const char* forced = SDL_getenv("FE8_REFRESH_HZ"); // testing: pretend another refresh rate
+    double hz = 0;
+    int divisor = 0;
+    double speed = 1.0;
+
+    if (sMeasuredHz > 0)
+        hz = sMeasuredHz;
+    else if (forced)
+        hz = SDL_atof(forced);
+    else if (mode && mode->refresh_rate_numerator > 0 && mode->refresh_rate_denominator > 0)
+        hz = (double)mode->refresh_rate_numerator / mode->refresh_rate_denominator;
+    else if (mode)
+        hz = mode->refresh_rate;
+
+    const bool lockable = PortPacing_LockToDisplay(hz, &divisor, &speed);
+    const int oldDivisor = sSyncDivisor;
+    const double oldHz = sRefreshHz;
+    sRefreshHz = hz > 0 ? hz : 0;
+    sRefreshNs = hz > 0 ? (uint64_t)(1e9 / hz) : 0;
+    sSyncDivisor = sConfig.syncToDisplay && lockable ? divisor : 0;
+    sSyncSpeed = sSyncDivisor ? speed : 1.0;
+    sSyncFrameNs = sSyncDivisor ? (uint64_t)(1e9 * divisor / hz) : GBA_FRAME_NS;
+    if (!sSyncDivisor)
+        SetAudioRatio(1.0);
+    sVsyncScore = 1.0f;
+    sLastPresentNs = 0;
+    sIntervalCount = 0;
+    if (oldDivisor != sSyncDivisor || oldHz != sRefreshHz) {
+        if (sSyncDivisor)
+            Port_Log("display %.2f Hz: game locked to it (1 frame every %d refreshes, speed %+.2f %%)", hz, divisor,
+                     (speed - 1.0) * 100.0);
+        else
+            Port_Log("display %.2f Hz: game paced by the GBA clock (59.73 Hz)", hz);
+    }
+}
+
+// For the menu: what the pacing options do on this screen (ASCII).
+static void SyncStatus(char* text, size_t size)
+{
+    int divisor;
+    double speed;
+
+    if (sRefreshHz <= 0)
+        SDL_snprintf(text, size, "Unknown refresh rate: the GBA clock is used (59.73 Hz).");
+    else if (sSyncDivisor)
+        SDL_snprintf(text, size, "Screen at %.2f Hz: the game runs at %.2f fps (%+.2f %%).", sRefreshHz,
+                     sRefreshHz / sSyncDivisor, (sSyncSpeed - 1.0) * 100.0);
+    else if (PortPacing_LockToDisplay(sRefreshHz, &divisor, &speed))
+        SDL_snprintf(text, size, "Screen at %.2f Hz: the game runs at 59.73 fps (GBA clock).", sRefreshHz);
+    else
+        SDL_snprintf(text, size, "Screen at %.2f Hz: not a multiple of 60 Hz, the GBA clock is used.",
+                     sRefreshHz);
+}
+
+// Sound queue to keep while locked: two device buffers and a frame, at least
+// 40 ms (well under the 100 ms where new sound is dropped).
+static double AudioTarget(void)
+{
+    const double frame = PORT_AUDIO_RATE / PORT_GBA_FRAME_RATE;
+    return SDL_min(PORT_AUDIO_RATE * 0.07, SDL_max(PORT_AUDIO_RATE * 0.04, 2.0 * sAudioChunk + frame));
 }
 
 // Picture width for the widescreen setting ("auto" follows the window).
@@ -287,15 +409,33 @@ static bool SetFrameWidth(int width)
     }
     sFrameW = width;
     SDL_UpdateTexture(sTexture, NULL, sLastFrame, sFrameW * 4);
+    // Frame blending's previous frame must have the same size.
+    if (sPrevTexture) {
+        SDL_DestroyTexture(sPrevTexture);
+        sPrevTexture =
+            SDL_CreateTexture(sRenderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, width, GBA_SCREEN_HEIGHT);
+        if (sPrevTexture)
+            SDL_SetTextureScaleMode(sPrevTexture, sConfig.smoothScaling ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
+        sPrevValid = false;
+    }
     return true;
 }
 
 static void ApplyVideoConfig(void)
 {
+    const SDL_ScaleMode scale = sConfig.smoothScaling ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST;
     Port_WideSetWidth(WantedFrameWidth());
     SetFrameWidth(Port_WideWidth());
-    SDL_SetRenderVSync(sRenderer, sConfig.vsync ? 1 : 0);
-    SDL_SetTextureScaleMode(sTexture, sConfig.smoothScaling ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
+    SDL_SetRenderVSync(sRenderer, VsyncWanted() ? 1 : 0);
+    SDL_SetTextureScaleMode(sTexture, scale);
+    if (sConfig.frameBlend && !sPrevTexture) {
+        sPrevTexture = SDL_CreateTexture(sRenderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING,
+                                         sFrameW, GBA_SCREEN_HEIGHT);
+        sPrevValid = false;
+    }
+    if (sPrevTexture)
+        SDL_SetTextureScaleMode(sPrevTexture, scale);
+    UpdateDisplaySync();
     if (sAudio)
         SDL_SetAudioStreamGain(sAudio, sConfig.volume / 100.0f);
 }
@@ -430,7 +570,8 @@ static void DrawToast(void)
 }
 
 // Game screen (+ effect), touch pad and messages. The caller presents.
-static void DrawScene(bool touchPad)
+// `blend` < 1 mixes in the previous game frame (frame blending).
+static void DrawScene(bool touchPad, float blend)
 {
     const SDL_FRect dst = GameRect();
 
@@ -438,7 +579,14 @@ static void DrawScene(bool touchPad)
     SDL_RenderClear(sRenderer);
     SDL_FRect game;
     SDL_Texture* effect = BeginEffect(&dst, &game);
-    SDL_RenderTexture(sRenderer, sTexture, NULL, &game);
+    if (blend < 1.0f && sPrevTexture && sPrevValid) {
+        SDL_RenderTexture(sRenderer, sPrevTexture, NULL, &game);
+        SDL_SetTextureAlphaModFloat(sTexture, blend);
+        SDL_RenderTexture(sRenderer, sTexture, NULL, &game);
+        SDL_SetTextureAlphaModFloat(sTexture, 1.0f);
+    } else {
+        SDL_RenderTexture(sRenderer, sTexture, NULL, &game);
+    }
     EndEffect(effect, &dst);
     if (touchPad && sTouchVisible)
         DrawTouchPad(TouchKeys(), -2);
@@ -506,6 +654,7 @@ static bool LoadState(int slot, char* error, size_t errorSize)
         }
         SDL_UpdateTexture(sTexture, NULL, sLastFrame, sFrameW * 4);
     }
+    sPrevValid = false; // don't blend with the frame from before the load
     SDL_free(buf);
     if (r != PORT_STATE_OK) {
         Port_Log("state %s: %s", path, Port_StateResultText(r));
@@ -554,6 +703,83 @@ static bool StateInfo(int slot, char* text, size_t textSize, SDL_Texture** thumb
     }
     *thumbnail = sThumbs[slot];
     return true;
+}
+
+// ---- rumble ---------------------------------------------------------------------
+// port/src/rumble.c turns battle hits into motor levels every frame. Gamepads
+// get them with SDL_RumbleGamepad; the device's own vibrator (the phone's, or
+// the AYN Thor's) is an SDL haptic device that plays one-shot pulses.
+
+static SDL_Haptic* sHaptic;
+static bool sHapticTried;
+static float sRumbleLow, sRumbleHigh; // last levels sent to the gamepad
+static int sRumbleRefresh;
+
+static void OpenDeviceHaptic(void)
+{
+    int count = 0;
+    SDL_HapticID* ids;
+
+    if (sHapticTried)
+        return;
+    sHapticTried = true;
+    if (!SDL_InitSubSystem(SDL_INIT_HAPTIC)) {
+        Port_Log("rumble: no haptics: %s", SDL_GetError());
+        return;
+    }
+    ids = SDL_GetHaptics(&count);
+    // On Android the device vibrator is "VIBRATOR_SERVICE"; gamepads rumble
+    // through SDL_RumbleGamepad instead.
+    for (int pass = 0; pass < 2 && !sHaptic && ids; pass++) {
+        for (int i = 0; i < count && !sHaptic; i++) {
+            const char* name = SDL_GetHapticNameForID(ids[i]);
+            if (pass == 0 && !(name && SDL_strstr(name, "VIBRATOR")))
+                continue;
+            sHaptic = SDL_OpenHaptic(ids[i]);
+            if (sHaptic && !SDL_InitHapticRumble(sHaptic)) {
+                SDL_CloseHaptic(sHaptic);
+                sHaptic = NULL;
+            }
+            if (sHaptic)
+                Port_Log("rumble: vibrator %s", name ? name : "?");
+        }
+    }
+    SDL_free(ids);
+}
+
+static void StopRumble(void)
+{
+    if (sGamepad && (sRumbleLow > 0.0f || sRumbleHigh > 0.0f))
+        SDL_RumbleGamepad(sGamepad, 0, 0, 0);
+    sRumbleLow = sRumbleHigh = 0.0f;
+    if (sHaptic)
+        SDL_StopHapticRumble(sHaptic);
+}
+
+void Port_HostRumble(float low, float high, float pulse, int pulseMs)
+{
+    const float k = sConfig.rumbleStrength / 100.0f;
+
+    if (sConfig.rumbleGamepad && sGamepad) {
+        // Sent when it changes, and refreshed while it lasts.
+        const bool changed = SDL_fabsf(low - sRumbleLow) > 0.02f || SDL_fabsf(high - sRumbleHigh) > 0.02f;
+        const bool on = low > 0.0f || high > 0.0f;
+        if (changed || (on && --sRumbleRefresh <= 0)) {
+            SDL_RumbleGamepad(sGamepad, (Uint16)(SDL_min(low * k, 1.0f) * 0xFFFF),
+                              (Uint16)(SDL_min(high * k, 1.0f) * 0xFFFF), on ? 150 : 0);
+            sRumbleLow = low;
+            sRumbleHigh = high;
+            sRumbleRefresh = 5;
+        }
+    } else if (sRumbleLow > 0.0f || sRumbleHigh > 0.0f) {
+        StopRumble();
+    }
+
+    if (sConfig.rumbleDevice && pulse > 0.0f && k > 0.0f) {
+        OpenDeviceHaptic();
+        if (sHaptic)
+            SDL_PlayHapticRumble(sHaptic, SDL_min(pulse * k, 1.0f), (Uint32)pulseMs);
+    }
 }
 
 // ---- second screen ------------------------------------------------------------
@@ -967,6 +1193,7 @@ static void InitMenu(void)
         .drawTouchPad = MenuDrawTouchPad,
         .toast = MenuToast,
         .quit = MenuQuit,
+        .syncStatus = SyncStatus,
     };
     sMenuReady = PortMenu_Init(&host);
     if (!sMenuReady)
@@ -976,6 +1203,7 @@ static void InitMenu(void)
 // Runs the menu until it closes; the game is paused meanwhile.
 static void RunMenu(void)
 {
+    StopRumble();
     if (sAudio) {
         SDL_PauseAudioStreamDevice(sAudio);
         SDL_ClearAudioStream(sAudio);
@@ -993,10 +1221,10 @@ static void RunMenu(void)
                 sGamepad = SDL_OpenGamepad(e.gdevice.which);
             PortMenu_HandleEvent(&e);
         }
-        DrawScene(false);
+        DrawScene(false, 1.0f);
         PortMenu_Render();
         SDL_RenderPresent(sRenderer);
-        if (!sConfig.vsync)
+        if (!VsyncWanted())
             SDL_Delay(16);
     }
     PortConfig_Save(&sConfig, sConfigPath);
@@ -1007,6 +1235,9 @@ static void RunMenu(void)
         sFingers[i].down = false;
     sInputLatch = true;
     sFastForwardHeld = false;
+    sPrevValid = false;
+    sAudioQueued = 0;
+    sLastPresentNs = 0;
     sNextFrameNs = SDL_GetTicksNS();
 }
 
@@ -1078,12 +1309,17 @@ bool Port_HostInit(const PortHostConfig* cfg)
     InitMenu();
     Screen2Init();
     Screen2Apply();
+    sSyncLog = SDL_getenv("FE8_SYNC_LOG") != NULL;
     sNextFrameNs = SDL_GetTicksNS();
+    sSyncLogNs = sNextFrameNs;
     return true;
 }
 
 void Port_HostShutdown(void)
 {
+    StopRumble();
+    if (sHaptic)
+        SDL_CloseHaptic(sHaptic);
     Screen2Shutdown();
     if (sMenuReady)
         PortMenu_Shutdown();
@@ -1093,6 +1329,8 @@ void Port_HostShutdown(void)
     }
     if (sMask)
         SDL_DestroyTexture(sMask);
+    if (sPrevTexture)
+        SDL_DestroyTexture(sPrevTexture);
     if (sEffectTarget)
         SDL_DestroyTexture(sEffectTarget);
     if (sAudio)
@@ -1163,6 +1401,11 @@ static bool PumpEvents(void)
         if (Screen2Event(&e))
             continue;
         switch (e.type) {
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+        case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+            sMeasuredHz = 0;
+            UpdateDisplaySync();
+            break;
         case SDL_EVENT_QUIT:
             return false;
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
@@ -1232,6 +1475,55 @@ static bool PumpEvents(void)
     return true;
 }
 
+// Did presenting wait for VSync lately? Pacing by VSync only works if it does
+// (not with a hidden window, or a driver that ignores it).
+static bool VsyncWorks(void)
+{
+    return VsyncWanted() && sRefreshNs > 0 && sVsyncScore > 0.5f;
+}
+
+static int CompareU32(const void* a, const void* b)
+{
+    const uint32_t x = *(const uint32_t*)a, y = *(const uint32_t*)b;
+    return x < y ? -1 : x > y;
+}
+
+// While locked, checks that VSync really ticks at the reported rate (a phone
+// may report its 120 Hz mode but give the app 60 Hz). Refreshes missed when a
+// frame runs late only make intervals longer, so the lower quartile of the
+// time between presents is the real refresh period.
+static void CheckRefreshRate(uint64_t now)
+{
+    if (sLastPresentNs && now - sLastPresentNs < 200000000ull)
+        sIntervals[sIntervalCount++] = (uint32_t)(now - sLastPresentNs);
+    sLastPresentNs = now;
+    if (sIntervalCount < (int)SDL_arraysize(sIntervals))
+        return;
+    sIntervalCount = 0;
+    qsort(sIntervals, SDL_arraysize(sIntervals), sizeof(sIntervals[0]), CompareU32);
+    const double hz = 1e9 / sIntervals[SDL_arraysize(sIntervals) / 4];
+    if (SDL_fabs(hz - sRefreshHz) > sRefreshHz * 0.05) {
+        Port_Log("VSync runs at %.2f Hz, not %.2f Hz", hz, sRefreshHz);
+        sMeasuredHz = hz;
+        UpdateDisplaySync();
+    }
+}
+
+// SDL_RenderPresent, watching whether it waited for the refresh. `start` is
+// when drawing this frame began.
+static bool Present(uint64_t start)
+{
+    SDL_RenderPresent(sRenderer);
+    const uint64_t now = SDL_GetTicksNS();
+    const bool waited = now - start >= sRefreshNs / 4;
+    sVsyncScore += ((waited ? 1.0f : 0.0f) - sVsyncScore) * 0.1f;
+    if (sSyncDivisor && VsyncWorks() && !FastForwarding())
+        CheckRefreshRate(now);
+    else
+        sLastPresentNs = 0;
+    return waited;
+}
+
 bool Port_HostPresent(const uint32_t* abgr, int width, int height)
 {
     if (!PumpEvents())
@@ -1239,16 +1531,41 @@ bool Port_HostPresent(const uint32_t* abgr, int width, int height)
 
     if (!SetFrameWidth(width))
         return false;
+    // Frame blending keeps the previous frame in a second texture. Only on
+    // screens clearly faster than the GBA (at 60 Hz there is nothing to mix).
+    sBlendActive = sConfig.frameBlend && sPrevTexture && !sSyncDivisor && !FastForwarding() && sRefreshNs > 0 &&
+                   sRefreshNs < GBA_FRAME_NS * 9 / 10 && VsyncWorks();
+    if (sBlendActive) {
+        SDL_Texture* t = sPrevTexture;
+        sPrevTexture = sTexture;
+        sTexture = t;
+        sPrevValid = true;
+    } else {
+        sPrevValid = false;
+    }
     memcpy(sLastFrame, abgr, (size_t)width * GBA_SCREEN_HEIGHT * sizeof(uint32_t));
     SDL_UpdateTexture(sTexture, NULL, abgr, width * (int)sizeof(uint32_t));
     (void)height;
     // "auto" widescreen follows the window (the next frame uses it).
     if (sConfig.widescreen == PORT_WIDE_AUTO)
         Port_WideSetWidth(WantedFrameWidth());
-    DrawScene(true);
-    SDL_RenderPresent(sRenderer);
+    sFrameShownNs = SDL_GetTicksNS();
+    DrawScene(true, sBlendActive ? PortPacing_BlendAlpha(sFrameShownNs + sRefreshNs, sFrameShownNs, GBA_FRAME_NS)
+                                 : 1.0f);
+    Present(sFrameShownNs);
     Screen2Present();
     return true;
+}
+
+// Shows the current game frame again for one more refresh. Returns false if
+// presenting did not wait for VSync.
+static bool PresentAgain(void)
+{
+    const uint64_t start = SDL_GetTicksNS();
+    const float blend = sBlendActive ? PortPacing_BlendAlpha(start + sRefreshNs, sFrameShownNs, GBA_FRAME_NS) : 1.0f;
+
+    DrawScene(true, blend);
+    return Present(start);
 }
 
 uint16_t Port_HostPollKeys(void)
@@ -1303,15 +1620,46 @@ void Port_HostQueueAudio(const int16_t* samples, int frames)
     // the extra sound is dropped instead of building up a delay.
     const int maxQueued = PORT_AUDIO_RATE / 10 * 4;
 
-    if (!sAudio || frames <= 0 || SDL_GetAudioStreamQueued(sAudio) > maxQueued)
+    if (!sAudio || frames <= 0)
+        return;
+    const int queuedBefore = SDL_GetAudioStreamQueued(sAudio);
+    if (sSyncLog) {
+        sAudioDry += queuedBefore == 0;
+        sAudioDropped += queuedBefore > maxQueued;
+    }
+    if (queuedBefore > maxQueued)
         return;
     SDL_PutAudioStreamData(sAudio, samples, frames * 4);
+
+    // Locked to the display, the game makes sound a little faster than real
+    // time: play it that much faster, nudged to keep the queue at its target.
+    if (sSyncDivisor && !FastForwarding()) {
+        const int queued = SDL_GetAudioStreamQueued(sAudio);
+        if (queued >= 0)
+            sAudioQueued += (queued / 4.0 - sAudioQueued) * 0.05;
+        SetAudioRatio(PortPacing_AudioRatio(sSyncSpeed, sAudioQueued, AudioTarget()));
+    }
 }
 
-void Port_HostWaitFrame(void)
+static void LogSyncStats(void)
 {
-    const bool fast = sConfig.fastForwardToggle ? sFastForwardOn : sFastForwardHeld;
-    const uint64_t frameNs = fast ? GBA_FRAME_NS / (uint64_t)sConfig.fastForwardSpeed : GBA_FRAME_NS;
+    const uint64_t now = SDL_GetTicksNS();
+    sSyncLogFrames++;
+    if (now - sSyncLogNs < 5000000000ull)
+        return;
+    Port_Log("pacing: %.3f game fps, sound queue %.1f ms (target %.1f), ratio %.5f, ran dry %d, dropped %d, %s",
+             sSyncLogFrames * 1e9 / (double)(now - sSyncLogNs),
+             sAudio ? SDL_GetAudioStreamQueued(sAudio) / 4.0 / PORT_AUDIO_RATE * 1000 : 0.0,
+             AudioTarget() / PORT_AUDIO_RATE * 1000, sAudioRatio, sAudioDry, sAudioDropped,
+             sSyncDivisor ? "locked to the display" : sBlendActive ? "blending" : "GBA clock");
+    sSyncLogNs = now;
+    sSyncLogFrames = 0;
+    sAudioDry = sAudioDropped = 0;
+}
+
+// Sleeps until the next tick of a `frameNs` clock.
+static void WaitTick(uint64_t frameNs)
+{
     const uint64_t now = SDL_GetTicksNS();
 
     sNextFrameNs += frameNs;
@@ -1320,6 +1668,41 @@ void Port_HostWaitFrame(void)
     } else if (now - sNextFrameNs > 4 * GBA_FRAME_NS) {
         sNextFrameNs = now; // fell far behind (debugger, app suspended): resync
     }
+}
+
+// Locked to the display: VSync paces the game (presenting waited for the
+// refresh). If it does not wait (hidden window, driver that ignores VSync),
+// a clock at the display's rate takes over.
+static void WaitLocked(void)
+{
+    for (int i = 1; i < sSyncDivisor; i++)
+        PresentAgain();
+    if (VsyncWorks())
+        sNextFrameNs = SDL_GetTicksNS();
+    else
+        WaitTick(sSyncFrameNs);
+}
+
+void Port_HostWaitFrame(void)
+{
+    const bool fast = FastForwarding();
+    const uint64_t frameNs = fast ? GBA_FRAME_NS / (uint64_t)sConfig.fastForwardSpeed : GBA_FRAME_NS;
+
+    if (sSyncLog)
+        LogSyncStats();
+    if (sSyncDivisor && !fast) {
+        WaitLocked();
+        return;
+    }
+    // Frame blending: show the in-between refreshes until the next game frame.
+    if (sBlendActive) {
+        while (SDL_GetTicksNS() + sRefreshNs <= sNextFrameNs + frameNs) {
+            if (!PresentAgain())
+                break;
+        }
+    }
+
+    WaitTick(frameNs);
 }
 
 // ---- ROM selection ----------------------------------------------------------------

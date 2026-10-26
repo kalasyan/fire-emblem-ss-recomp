@@ -190,7 +190,8 @@ void Port_RunFrame(void)
     // 3. Sound.
     Port_ApuRunFrame();
 
-    // 4. Present + input + pacing.
+    // 4. Rumble, then present + input + pacing.
+    Port_RumbleFrame();
     if (!Port_HostPresent(frame, width, GBA_SCREEN_HEIGHT))
         Port_RequestQuit();
     UpdateKeys();

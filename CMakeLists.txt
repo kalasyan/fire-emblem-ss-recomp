@@ -125,6 +125,8 @@ add_library(fe8_port STATIC
     port/src/savestate.c
     port/src/second_screen.c
     port/src/widescreen.c
+    port/src/rumble.c
+    port/src/pacing.c
     port/ppu/src/virtuappu.c
     port/ppu/src/mode1.c)
 target_include_directories(fe8_port PUBLIC port/include PRIVATE port/ppu/include)
@@ -168,6 +170,11 @@ if(FE8_HOST STREQUAL "headless")
     target_compile_options(fe8_headless PRIVATE -std=gnu11 -Wall -Wextra -fno-pic -fno-pie)
     target_link_libraries(fe8_headless PRIVATE fe8_port fe8_game fe8_port)
     fe8_low_image(fe8_headless)
+    # Frame pacing / sound rate control test (no ROM needed).
+    add_executable(fe8_pacing_test tools/port/pacing_test.c port/src/pacing.c)
+    target_include_directories(fe8_pacing_test PRIVATE port/include)
+    target_compile_options(fe8_pacing_test PRIVATE -std=gnu11 -Wall -Wextra)
+    target_link_libraries(fe8_pacing_test PRIVATE m)
 elseif(FE8_HOST STREQUAL "sdl")
     if(NOT ANDROID)
         find_package(SDL3 CONFIG QUIET)

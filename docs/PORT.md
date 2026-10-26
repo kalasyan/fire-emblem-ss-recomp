@@ -92,6 +92,46 @@ the map on narrow maps).
 
 `fe8_headless --width W` renders at that width (284 = 16:9).
 
+## Rumble
+
+Every hit in a battle is reported as its damage shows up: when a battle scene
+starts draining an HP bar (`src/banim-efxhpbar.c`) and when a hit lands on the
+map with battle scenes off (`src/mapanim_spellassoc.c`). `port/src/rumble.c`
+turns each hit into a short effect, stronger for bigger hits, critical hits
+and the blow that defeats a unit; the strongest one drives both gamepad
+motors (`SDL_RumbleGamepad`). The device vibrator (on Android, SDL's
+`VIBRATOR_SERVICE` haptic device) only supports pulses, so it gets one each
+time the rumble starts or gets stronger. Effects are dropped when a save state
+is loaded. Options in `settings.ini` (`[rumble] gamepad, device, strength`)
+and in the menu, off by default. `FE8_RUMBLE_LOG=1` logs every hit (also in
+`fe8_headless`).
+
+## Smoothness: 60/120 Hz and frame blending
+
+The GBA draws 59.7275 frames per second and almost all displays run at 60 Hz
+(or 90, 120, 144...). By default the game follows the GBA clock, so on a 60 Hz
+display with VSync one frame is shown twice every ~3.7 s, and at 144 Hz frames
+last 2 or 3 refreshes irregularly. Two options in `settings.ini` (`[video]`)
+and in the menu (Video, Smoothness), both off by default and only in the SDL
+frontend (`port/src/host_sdl.c` and `port/src/pacing.c`):
+
+- `sync_to_display = true`: if the display refresh rate is a multiple of
+  ~59.73 Hz within 1% (59.94, 60, 120, 240 Hz...), the game runs one frame
+  every N refreshes, paced by VSync: at 60 Hz it runs 0.46% faster and every
+  frame lasts exactly one refresh. Sound plays that same 0.46% faster with a
+  small dynamic correction that keeps the audio queue at a fixed level, so it
+  neither drains nor overflows. On other displays the GBA clock is followed.
+- `frame_blend = true`: on displays that can't be synced (90, 144 Hz...), each
+  refresh blends the last two frames according to the moment it is shown. It
+  spreads motion evenly at the cost of a slight trail and half a frame of
+  latency.
+
+Both turn VSync on, and neither touches the game logic. `fe8_pacing_test`
+(built with the headless host and run in CI) simulates 10 minutes of sound at
+several refresh rates and sound card clock errors. `FE8_SYNC_LOG=1` prints
+the game fps, audio queue level and speed ratio every 5 s, and
+`FE8_REFRESH_HZ=N` fakes another display refresh rate.
+
 ## Differences from the GBA that need code changes
 
 Most fixes in `src/` are under `#ifdef PLATFORM_PC`:

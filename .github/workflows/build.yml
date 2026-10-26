@@ -45,6 +45,8 @@ jobs:
           fi
           cat out.txt
           grep -q "ROM rejected" out.txt
+      - name: Frame pacing test
+        run: ./build/fe8_pacing_test
 
   appimage:
     name: Linux / Steam Deck AppImage (${{ matrix.region }})

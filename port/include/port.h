@@ -115,6 +115,16 @@ uint16_t Port_HostPollKeys(void);
 void Port_HostQueueAudio(const int16_t* samples, int frames);
 // Block until the next 1/59.73 s tick (no-op when running unthrottled).
 void Port_HostWaitFrame(void);
+// Rumble for this frame (port/src/rumble.c). low/high: strength 0..1 of the
+// low / high frequency motors of a gamepad, sent every frame. pulse > 0: a
+// vibration of that strength and length starts now (for vibrators that only
+// take one-shot pulses, like a phone's).
+void Port_HostRumble(float low, float high, float pulse, int pulseMs);
+// Once per frame, before presenting: works out the rumble from the hits the
+// game reported (Port_RumbleHit, platform.h) and calls Port_HostRumble.
+void Port_RumbleFrame(void);
+// After a save state was loaded: stop the rumble.
+void Port_RumbleReset(void);
 // The player's ROM. Returns a malloc'd copy of the whole file, or NULL if
 // the user gave up (the game then quits). `error` is set on a retry after
 // a ROM was rejected, so the host can tell the user why.
